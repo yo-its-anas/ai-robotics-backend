@@ -1,0 +1,22 @@
+
+
+# FastAPI and server dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# Google Gemini API
+google-generativeai==0.3.1
+
+# Qdrant vector database client
+qdrant-client==1.7.0
+
+# Utilities
+python-dotenv==1.0.0
+tiktoken==0.5.2
+aiohttp==3.9.1
+tqdm==4.66.1
+
+# CORS support
+python-multipart==0.0.6
+
