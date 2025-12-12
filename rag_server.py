@@ -154,34 +154,28 @@ async def embed_query(query: str) -> List[float]:
 
 async def search_qdrant(embedding: List[float], top_k: int = TOP_K) -> List[dict]:
     """
-    Search Qdrant for similar chunks.
-
-    Args:
-        embedding: Query embedding vector
-        top_k: Number of results to return
-
-    Returns:
-        List of search results with text, metadata, and scores
-
-    Raises:
-        HTTPException: If Qdrant search fails
+    Vector search using Qdrant v2.x (replaces deprecated client.search)
     """
     try:
         client = get_qdrant_client()
-        search_results = client.search(
+
+        response = client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=embedding,
-            limit=top_k
+            query=embedding,       # vector
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False
         )
 
         results = []
-        for hit in search_results:
+        for point in response.points:
+            payload = point.payload or {}
             results.append({
-                "text": hit.payload.get("text", ""),
-                "source": hit.payload.get("source", "unknown"),
-                "section": hit.payload.get("section"),
-                "score": hit.score,
-                "metadata": hit.payload
+                "text": payload.get("text", ""),
+                "source": payload.get("source", "unknown"),
+                "section": payload.get("section"),
+                "score": point.score,
+                "metadata": payload
             })
 
         return results
@@ -191,6 +185,7 @@ async def search_qdrant(embedding: List[float], top_k: int = TOP_K) -> List[dict
             status_code=503,
             detail=f"Qdrant search failed: {str(e)}"
         )
+
 
 
 async def generate_response(question: str, context: str, mode: str = "normal_rag") -> str:
