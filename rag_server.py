@@ -420,7 +420,6 @@ async def root():
 
 
 # For Vercel serverless deployment
-handler = app
-
+app = app
 
 
