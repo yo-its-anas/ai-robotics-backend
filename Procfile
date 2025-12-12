@@ -1,1 +1,1 @@
-web: uvicorn rag_server:app --host 0.0.0.0 --port 10000
+web: python rag_server.py
