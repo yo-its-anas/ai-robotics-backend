@@ -66,7 +66,7 @@ def get_embedding_model() -> SentenceTransformer:
     """Lazy initialization of embedding model."""
     global embedding_model
     if embedding_model is None:
-        embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
     return embedding_model
 
 
