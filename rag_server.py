@@ -1,3 +1,15 @@
+"""
+RAG Chatbot FastAPI Server (Render Free-Tier Safe)
+
+Modes:
+- Normal RAG: question → Qdrant (scroll fallback) → Gemini → response
+- Selected Text: question + selectedText → Gemini → response
+
+Endpoints:
+- POST /api/query
+- GET  /api/health
+"""
+
 import os
 import time
 from typing import Optional, List
@@ -7,13 +19,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from qdrant_client import QdrantClient
 
 # ------------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------------
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -21,14 +33,18 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "robotics_textbook_chunks")
 
-TOP_K = 5
-MAX_CONTEXT_LENGTH = 4000
+TOP_K = int(os.getenv("TOP_K_RESULTS", "5"))
+MAX_CONTEXT_LENGTH = int(os.getenv("MAX_CONTEXT_LENGTH", "4000"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 # ------------------------------------------------------------------
 # APP
 # ------------------------------------------------------------------
-app = FastAPI(title="RAG Chatbot API")
+
+app = FastAPI(
+    title="AI Robotics RAG API",
+    version="1.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,33 +54,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# ------------------------------------------------------------------
+# GEMINI
+# ------------------------------------------------------------------
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required")
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 # ------------------------------------------------------------------
-# LAZY LOADERS (IMPORTANT)
+# QDRANT (lazy)
 # ------------------------------------------------------------------
-_embedding_model: Optional[SentenceTransformer] = None
+
 _qdrant_client: Optional[QdrantClient] = None
 
 
-def get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        )
-    return _embedding_model
-
-
-def get_qdrant():
+def get_qdrant_client() -> QdrantClient:
     global _qdrant_client
     if _qdrant_client is None:
+        if not QDRANT_URL or not QDRANT_API_KEY:
+            raise HTTPException(503, "Qdrant not configured")
         _qdrant_client = QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,
+            timeout=30,
             prefer_grpc=False,
-            timeout=60,
         )
     return _qdrant_client
 
@@ -72,8 +87,9 @@ def get_qdrant():
 # ------------------------------------------------------------------
 # MODELS
 # ------------------------------------------------------------------
+
 class QueryRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1)
     selectedText: Optional[str] = None
 
 
@@ -81,6 +97,7 @@ class Source(BaseModel):
     source: str
     chunk_text: str
     score: float
+    section: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
@@ -90,38 +107,57 @@ class QueryResponse(BaseModel):
     response_time_ms: int
 
 
+class HealthResponse(BaseModel):
+    status: str
+    qdrant_connected: bool
+    gemini_configured: bool
+    collection_name: str
+    collection_points: Optional[int]
+
+
 # ------------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------------
-def embed(text: str) -> List[float]:
-    model = get_embedding_model()
-    return model.encode(text).tolist()
 
-
-def search_qdrant(vector: List[float]):
-    client = get_qdrant()
-    res = client.query_points(
+async def qdrant_fallback_search(limit: int = TOP_K) -> List[dict]:
+    """
+    Safe scroll-based retrieval (NO embeddings, NO memory spikes).
+    """
+    client = get_qdrant_client()
+    points, _ = client.scroll(
         collection_name=COLLECTION_NAME,
-        query=vector,
-        limit=TOP_K,
+        limit=limit,
         with_payload=True,
     )
 
     results = []
-    for p in res.points:
+    for p in points:
         payload = p.payload or {}
         results.append({
             "text": payload.get("text", ""),
             "source": payload.get("source", "unknown"),
-            "score": p.score,
+            "section": payload.get("section"),
+            "score": 1.0,
         })
 
     return results
 
 
-def generate_answer(question: str, context: str) -> str:
-    prompt = f"""
-You are an AI Robotics textbook assistant.
+def build_prompt(question: str, context: str, selected: bool) -> str:
+    if selected:
+        return f"""
+You are an AI Robotics tutor.
+
+Highlighted text:
+{context}
+
+Question:
+{question}
+
+Explain clearly in simple terms.
+"""
+    return f"""
+You are an AI assistant for an AI Robotics textbook.
 
 Context:
 {context}
@@ -129,23 +165,38 @@ Context:
 Question:
 {question}
 
-Answer clearly and concisely:
+Answer clearly and concisely.
 """
 
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
+
+async def generate_answer(prompt: str) -> str:
+    model = genai.GenerativeModel("models/gemini-2.5-flash")
     response = model.generate_content(prompt)
+    if not response or not response.text:
+        raise HTTPException(500, "Empty response from Gemini")
     return response.text.strip()
 
 
 # ------------------------------------------------------------------
 # ENDPOINTS
 # ------------------------------------------------------------------
+
 @app.post("/api/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
+async def query(request: QueryRequest):
     start = time.time()
 
-    if req.selectedText:
-        answer = generate_answer(req.question, req.selectedText)
+    if not request.question.strip():
+        raise HTTPException(400, "Question cannot be empty")
+
+    # ---------------- Selected Text Mode ----------------
+    if request.selectedText and request.selectedText.strip():
+        prompt = build_prompt(
+            request.question,
+            request.selectedText.strip(),
+            selected=True,
+        )
+        answer = await generate_answer(prompt)
+
         return QueryResponse(
             answer=answer,
             mode="selected_text",
@@ -153,22 +204,30 @@ async def query(req: QueryRequest):
             response_time_ms=int((time.time() - start) * 1000),
         )
 
-    vector = embed(req.question)
-    hits = search_qdrant(vector)
+    # ---------------- Normal RAG Mode ----------------
+    docs = await qdrant_fallback_search()
 
-    if not hits:
-        raise HTTPException(404, "No relevant content found")
+    if not docs:
+        raise HTTPException(404, "No content found")
 
-    context = "\n\n".join(h["text"] for h in hits)
-    answer = generate_answer(req.question, context)
+    context = "\n\n".join(
+        f"[{d['source']}]\n{d['text']}" for d in docs
+    )
+
+    if len(context) > MAX_CONTEXT_LENGTH:
+        context = context[:MAX_CONTEXT_LENGTH]
+
+    prompt = build_prompt(request.question, context, selected=False)
+    answer = await generate_answer(prompt)
 
     sources = [
         Source(
-            source=h["source"],
-            chunk_text=h["text"][:200],
-            score=round(h["score"], 3),
+            source=d["source"],
+            chunk_text=d["text"][:200],
+            score=d["score"],
+            section=d.get("section"),
         )
-        for h in hits
+        for d in docs
     ]
 
     return QueryResponse(
@@ -179,6 +238,28 @@ async def query(req: QueryRequest):
     )
 
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
+@app.get("/api/health", response_model=HealthResponse)
+async def health():
+    qdrant_ok = False
+    points = None
+
+    try:
+        client = get_qdrant_client()
+        info = client.get_collection(COLLECTION_NAME)
+        qdrant_ok = True
+        points = info.points_count
+    except Exception:
+        pass
+
+    return HealthResponse(
+        status="healthy" if qdrant_ok else "degraded",
+        qdrant_connected=qdrant_ok,
+        gemini_configured=True,
+        collection_name=COLLECTION_NAME,
+        collection_points=points,
+    )
+
+
+@app.get("/")
+async def root():
+    return {"service": "AI Robotics RAG API"}
